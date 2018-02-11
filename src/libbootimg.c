@@ -1,3 +1,4 @@
+#include <arpa/inet.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -10,6 +11,7 @@
 #include <limits.h>
 
 #include "../include/libbootimg.h"
+#include "../src/memmem.h"
 
 #define DEFAULT_PAGE_SIZE 2048
 
@@ -181,6 +183,9 @@ int libbootimg_init_load(struct bootimg *img, const char *path, int load_blob_ma
             addr += align_size(*blob->size, img->hdr.page_size);
         }
     }
+
+    // Fail silent: A FDT is not neccessarily present.
+    libbootimg_get_fdt_info(img);
 
     fclose(f);
     return 0;
@@ -931,6 +936,111 @@ int libbootimg_dump_dtb(struct bootimg *b, const char *dest)
     return libbootimg_dump_blob(&b->blobs[LIBBOOTIMG_BLOB_DTB], dest);
 }
 
+static uint8_t* libbootimg_find_fdt(uint8_t *start_addr, uint32_t length)
+{
+    uint8_t *dtb_appended = NULL;
+    struct bootimg_blob *kernel_blob = NULL;
+    uint8_t fdt_magic[4] = { (uint8_t)(FDT_MAGIC >> 24),
+            (uint8_t)(FDT_MAGIC >> 16), (uint8_t)(FDT_MAGIC >> 8),
+            (uint8_t)(FDT_MAGIC) };
+
+    dtb_appended = memmem(start_addr, length, fdt_magic,
+            sizeof(fdt_magic));
+    if (dtb_appended != NULL)
+    {
+        LOG_DBG("FDT found at %x\n", (unsigned int)dtb_appended);
+    }
+    return dtb_appended;
+}
+
+int libbootimg_get_fdt_info(struct bootimg *b)
+{
+    struct boot_img_fdt fdt_info;
+    struct fdt_header fdt_hdr;
+    uint8_t *search_addr;
+    uint8_t *fdt_addr;
+
+    /* First, test the separated for the existence of a FDT. */
+    struct bootimg_blob *dtb_blob = &(b->blobs[LIBBOOTIMG_BLOB_DTB]);
+    if (dtb_blob->size != NULL && dtb_blob->data != NULL)
+    {
+        search_addr = dtb_blob->data;
+
+        fdt_addr = libbootimg_find_fdt(search_addr, *dtb_blob->size);
+        if (fdt_addr != NULL)
+        {
+            memcpy(&fdt_hdr, fdt_addr, sizeof(struct fdt_header));
+            fdt_info.fdt_hdr = (struct fdt_header *)fdt_addr;
+            fdt_info.is_fdt_appended = 0;
+            fdt_info.fdt_addr = fdt_addr;
+            /* Special case for separate DTBs: The size is not correctly written
+             * to the header: Calculate the FDT size from the DTB size.
+             * Also, u pdate the FDT size in the loaded blob. */
+            fdt_info.fdt_size = *(dtb_blob->size) - (fdt_addr - search_addr);
+            fdt_hdr.totalsize = ntohl(fdt_info.fdt_size);
+            b->fdt_info = fdt_info;
+
+            LOG_DBG("Found FDT in DTB.\n");
+            goto ret_ok;
+        }
+    }
+
+    // Secondly, search the kernel for an appended FDT.
+    struct bootimg_blob *kernel_blob = &(b->blobs[LIBBOOTIMG_BLOB_KERNEL]);
+    if (kernel_blob->size == NULL && kernel_blob->data != NULL)
+    {
+        search_addr = kernel_blob->data;
+        fdt_addr = libbootimg_find_fdt(search_addr, *(kernel_blob->size));
+        if (fdt_addr != NULL)
+        {
+            //memcpy(&fdt_hdr, fdt_addr, sizeof(struct fdt_header));
+            fdt_info.fdt_hdr = (struct fdt_header *)fdt_addr;
+            fdt_info.is_fdt_appended = 1;
+            fdt_info.fdt_addr = fdt_addr;
+            // We require endianess conversion for kernel-appended DTBs.
+            fdt_info.fdt_size = htonl(fdt_info.fdt_hdr->totalsize);
+            b->fdt_info = fdt_info;
+            LOG_DBG("Found FDT appended to kernel.\n");
+            goto ret_ok;
+        }
+    }
+
+    return -1;
+
+ret_ok:
+#ifdef DEBUG_VERBOSE
+    LOG_DBG("FDT_addr: %x\n", fdt_addr);
+    LOG_DBG("FDT_addr: %x\n", b->fdt_info.fdt_hdr);
+    LOG_DBG("FDT_appended: %x\n", b->fdt_info.is_fdt_appended);
+    LOG_DBG("FDT_size: %x\n", b->fdt_info.fdt_size);
+    LOG_DBG("FDT_info: %x\n", b->fdt_info);
+#endif // DEBUG_VERBOSE
+    return 0;
+}
+
+int libbootimg_dump_fdt(struct bootimg *b, const char *dest)
+{
+    FILE *fd;
+    struct boot_img_fdt *fdt_info = &(b->fdt_info);
+    uint32_t dtb_size = 0;
+    int res = 0;
+
+    fd = fopen(dest, "w");
+    if (!fd)
+    {
+        res = translate_errnum(errno);
+        return res;
+    }
+
+    if (fwrite(fdt_info->fdt_addr, fdt_info->fdt_size, 1 ,fd) != 1)
+    {
+        res = LIBBOOTIMG_ERROR_IO;
+    }
+
+    fclose(fd);
+    return res;
+}
+
 int libbootimg_load_blob(struct bootimg_blob *blob, const char *src)
 {
     FILE *f;
@@ -990,6 +1100,102 @@ int libbootimg_load_second(struct bootimg *b, const char *src)
     return libbootimg_load_blob(&b->blobs[LIBBOOTIMG_BLOB_SECOND], src);
 }
 
+int libbootimg_load_fdt(struct bootimg *b, const char *src)
+{
+    int res = 0;
+    struct stat info;
+    FILE *fd;
+    struct fdt_header *fdt_hdr_new;
+
+    struct bootimg_blob *blob_old;
+    if (b->fdt_info.is_fdt_appended)
+    {
+        blob_old = &(b->blobs[LIBBOOTIMG_BLOB_KERNEL]);
+    }
+    else
+    {
+        blob_old = &(b->blobs[LIBBOOTIMG_BLOB_DTB]);
+    }
+
+    // Source file handling: Info, opening, and basic information.
+    LOG_DBG("Loading FDT.\n");
+    if (stat(src, &info) < 0)
+    {
+        return translate_errnum(errno);
+    }
+    fd = fopen(src, "r");
+    if (!fd)
+    {
+        return translate_errnum(errno);
+    }
+    uint8_t *fdt_new_data = malloc(info.st_size);
+    if (fread(fdt_new_data, info.st_size, 1, fd) != 1)
+    {
+        res = translate_fread_error(fd);
+        free(fdt_new_data);
+        fclose(fd);
+        return -1;
+    }
+    fclose(fd);
+
+    // Ensure that the loaded file is a FDT.
+    if (fdt_check_header(fdt_new_data) != 0)
+    {
+        LOG_DBG("The given file does not start with the FDT magic."
+                "Doing nothing.\n");
+        return LIBBOOTIMG_ERROR_INVALID_MAGIC;
+    }
+
+    /* Values for appending the FDT to existing blobs.
+       NOTE: Values read from the FDT are machine-dependent, so respect the
+             correct endianess. */
+    fdt_hdr_new = (struct fdt_header*)fdt_new_data;
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    uint32_t fdt_size_new = fdt_hdr_new->totalsize;
+#else
+    uint32_t fdt_size_new = ntohl(fdt_hdr_new->totalsize);
+#endif // __BYTE__ORDER
+    uint32_t blob_pre_fdt_size = *(blob_old->size) - b->fdt_info.fdt_size;
+    uint32_t blob_total_size_new = blob_pre_fdt_size + fdt_size_new;
+    /* Target mem alloc */
+    uint8_t *blob_new_data = malloc(blob_total_size_new);
+    uint8_t *fdt_new_pos = (uint8_t*)(blob_new_data + blob_pre_fdt_size);
+
+#ifdef DEBUG_VERBOSE
+    LOG_DBG("FDT size new: %x\n", fdt_size_new);
+    LOG_DBG("FDT target pos: %x\n", fdt_new_pos);
+    LOG_DBG("FDT source pos: %x\n", fdt_new_data);
+    LOG_DBG("BLOB pre-FDT size: %x\n", blob_pre_fdt_size);
+    LOG_DBG("BLOB target size: %x\n", blob_total_size_new);
+    LOG_DBG("BLOB target addr: %x\n", blob_new_data);
+    LOG_DBG("BLOB source addr: %x\n", blob_old->data);
+#endif // DEBUG_VERBOSE
+
+    /* Write the new DTB to the corresponding structs. */
+    memcpy(blob_new_data, blob_old->data, blob_pre_fdt_size);
+    memcpy(fdt_new_pos, fdt_new_data, fdt_size_new);
+
+    // Update the blob structures
+    free(blob_old->data);
+    blob_old->data = blob_new_data;
+    *(blob_old->size) = blob_total_size_new;
+
+    // Update the bootimage info
+    b->fdt_info.fdt_hdr = (struct fdt_header*)fdt_new_pos;
+    b->fdt_info.fdt_size = fdt_size_new;
+
+    // Update the header info
+    if (b->fdt_info.is_fdt_appended)
+    {
+        b->hdr.kernel_size = blob_total_size_new;
+    }
+    else
+    {
+        b->hdr.dt_size = blob_total_size_new;
+    }
+    return 0;
+}
+
 int libbootimg_load_dtb(struct bootimg *b, const char *src)
 {
     return libbootimg_load_blob(&b->blobs[LIBBOOTIMG_BLOB_DTB], src);
@@ -1025,6 +1231,8 @@ int libbootimg_write_img_fileptr(struct bootimg *b, FILE *f)
     if(pos_start < 0)
         return translate_errnum(errno);
 
+    LOG_DBG("Kernel size: %x\n", b->hdr.kernel_size);
+    LOG_DBG("Ramdisk size: %x\n", b->hdr.ramdisk_size);
     if(b->hdr.kernel_size == 0 || b->hdr.ramdisk_size == 0)
         return LIBBOOTIMG_ERROR_MISSING_BLOB;
 
