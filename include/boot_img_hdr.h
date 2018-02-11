@@ -95,6 +95,13 @@ struct boot_img_hdr
     uint32_t id[8]; /* timestamp / checksum / sha1 / etc */
 };
 
+struct boot_img_fdt
+{
+    struct fdt_header *fdt_hdr;
+    uint8_t is_fdt_appended;
+    uint32_t fdt_size;
+};
+
 struct boot_img_elf_hdr_32
 {
     /* Global structure of the Sony ELF header - Respective usual values:  | 8960       | 8974       | */

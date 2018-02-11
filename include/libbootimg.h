@@ -12,6 +12,7 @@ extern "C" {
 #include <stdint.h>
 #include <stdio.h>
 #include <cutils/klog.h>
+#include <libfdt.h>
 #include "boot_img_hdr.h"
 
 #define LIBBOOTIMG_VERSION 0x000203 // 0xMMNNPP
@@ -100,6 +101,7 @@ struct bootimg
     uint32_t blob_size; /* Size of the complete blob */
     struct bootimg_blob blobs[LIBBOOTIMG_BLOB_CNT]; /*!< Blobs packed in the boot image */
     int start_offset; /*!< Offset of the boot image structure from the start of the file. Only used when loading blobs from boot.img file */
+    struct boot_img_fdt fdt_info; /* Information about a potentially present FDT (Kernel or DTB). */
     uint8_t is_elf; /*!< Select the ELF boot image format */
     struct boot_img_elf_info* hdr_info; /*!< Boot image meta-information for ELF formats */
 };
@@ -261,7 +263,13 @@ int libbootimg_dump_second(struct bootimg *b, const char *dest);
  */
 int libbootimg_dump_dtb(struct bootimg *b, const char *dest);
 
-
+/**
+ * Writes a dtb that is appended to a kernel image to a file.
+ * @param b pointer to struct bootimg
+ * @param dest path to destination file
+ * @return zero if successful, negative value from libbootimg_error if failed.
+ */
+int libbootimg_dump_fdt(struct bootimg *b, const char *dest);
 
 /**
  * Loads blob data from a file.
@@ -303,7 +311,14 @@ int libbootimg_load_second(struct bootimg *b, const char *src);
  */
 int libbootimg_load_dtb(struct bootimg *b, const char *src);
 
-
+/**
+ * Loads the given FDT blob data from a file and injects it to the corresponding
+ * blog (kernel or DTB).
+ * @param b pointer to struct bootimg
+ * @param src path to source file
+ * @return zero if successful, negative value from libbootimg_error if failed.
+ */
+int libbootimg_load_fdt(struct bootimg *b, const char *src);
 
 /**
  * Writes boot image to a file

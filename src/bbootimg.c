@@ -417,6 +417,12 @@ static int extract_bootimg(struct bbootimg_info *i)
         }
     }
 
+    if (*(i->img.blobs[LIBBOOTIMG_BLOB_DTB].size) == 0)
+    {
+        printf("here\n");
+        libbootimg_dump_dtb(&i->img, i->fname_blobs[LIBBOOTIMG_BLOB_DTB]);
+    }
+
     libbootimg_destroy(&i->img);
     return 0;
 }
